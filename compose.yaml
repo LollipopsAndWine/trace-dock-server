@@ -1,0 +1,28 @@
+services:
+  api:
+    image: ${TRACE_DOCK_IMAGE:-trace-dock-server:local}
+    build:
+      context: .
+    env_file:
+      - path: .env.production
+        format: raw
+    environment:
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: "8080"
+    ports:
+      - "${TRACE_DOCK_BIND_IP:-127.0.0.1}:${TRACE_DOCK_BIND_PORT:-8080}:8080"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 35m
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

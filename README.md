@@ -1,93 +1,138 @@
-# trace-dock server MVP
+# Trace Dock Server
 
-Python 3.12+ FastAPI 控制面 API，配置使用 Pydantic Settings，配套 CLI 位于 `../trace-dock`。只建 `participants` 和 `collections` 两张表；会话、排除项、大文件及 artifact 明细保存在 OSS manifest/JSONL 中。API 不接收 workspace 或轨迹文件上传。OSS 对象操作使用阿里云官方 OSS Python SDK v2，STS 使用官方 STS Python SDK；不保留手写签名实现。
+Trace Dock Server 是 Trace Dock CLI 的控制面服务。它负责身份验证、创建和恢复任务、发放限定当前任务前缀的临时 OSS 凭证，以及在上传完成后校验 manifest 和对象 CRC64。
 
-## 安装与启动
+文件正文不会经过 API 服务。CLI 直接把已授权的轨迹和 workspace 内容上传到私有 OSS，服务端只保存参与者和任务状态，并读取小型 manifest 完成校验。
+
+## 运行前准备
+
+本地开发需要：
+
+- Python 3.12+
+- `uv`
+- SQLite（仅限单进程临时验证）
+
+生产部署还需要：
+
+- PostgreSQL 数据库
+- 私有 OSS bucket
+- 可以签发限定 Job 前缀权限的 RAM/STS role
+- HTTPS 域名和反向代理或负载均衡
+- Docker Engine 与 Docker Compose 2.30+
+
+CLI 位于相邻的 [`trace-dock`](../trace-dock) 仓库。服务端启动后，参与者使用 CLI 连接服务端；不要把 token 写入 CLI 配置、镜像或日志。
+
+## 本地启动
+
+### 1. 安装依赖
+
+在服务端仓库根目录执行：
 
 ```bash
 uv venv --python 3.12
 uv pip install -e .
 cp .env.example .env
-# 编辑 .env；应用启动时会自动读取，进程环境变量优先
-.venv/bin/trace-dock-participants issue person@example.com
-.venv/bin/trace-dock-server
+chmod 600 .env
 ```
 
-服务启动函数位于 `trace_dock_server/http.py` 的 `main()`，上述命令由 `pyproject.toml` 的 `[project.scripts]` 生成。也可以在仓库根目录用 `.venv/bin/python main.py` 或 `.venv/bin/python -m trace_dock_server` 启动，三个入口共用相同的配置和启动逻辑。
+服务端会自动读取仓库根目录的 `.env`，进程环境变量优先。也可以通过 `TRACE_DOCK_ENV_FILE` 指定其他配置文件。
 
-## Docker / 阿里云 ECS 部署
+### 2. 配置 SQLite
 
-仓库提供 `Dockerfile`、`compose.yaml`、`.env.production.example` 和 Nginx HTTPS 示例。Docker 默认执行 `python -m trace_dock_server`，容器监听 `0.0.0.0:8080`，Compose 默认只映射宿主机回环端口，生产数据库使用外部 PostgreSQL。
-
-```bash
-cp .env.production.example .env.production
-chmod 600 .env.production
-# 编辑 .env.production，填写 PostgreSQL、固定 pepper、OSS 和 RAM/STS 参数
-docker compose config --quiet
-docker compose build api
-docker compose up -d api
-curl -fsS http://127.0.0.1:8080/healthz
-```
-
-Compose 需为 2.30.0 或更高版本。完整的 ECS/RDS、证书和 Nginx、双节点 ALB、发放 token、日志及更新步骤见 [ECS Docker 部署技术方案](docs/DEPLOY-ECS.md)。
-
-## 身份与数据持久化
-
-CLI 安装在另一个仓库完成：下载对应平台的发布二进制，校验 `SHA256SUMS` 后放入 `PATH`；或在 CLI 仓库执行 `go build -trimpath -o "$HOME/.local/bin/trace-dock" ./cmd/trace-dock`。启动后用 `trace-dock --server https://<你的服务域名>` 进入采集流程。
-
-`issue` 新建或重新签发高熵 token，仅当次向 stdout 显示；数据库只保存 `HMAC-SHA256(TOKEN_PEPPER, token)`。重新 issue 会撤销旧 token；`trace-dock-participants revoke person@example.com` 单独撤销。原始 token 应通过受控渠道交付本人，不写入配置或日志。pepper 必须在所有 API 节点保持一致，且持久保存在密钥管理系统中。
-
-首次启动或发放身份时幂等初始化两张表。生产使用 PostgreSQL、数据库唯一约束、事务和行锁；SQLite 只供临时单进程开发使用。`collections` 比方案逻辑字段多几个内部协调字段：创建指纹、冻结规则 JSON、选择摘要、manifest 大小及已验证对象数，用于幂等和恢复；不新增其他数据表。
-
-两张表均有 `created_at` 和 `updated_at`。数据库触发器负责维护 `updated_at`：新增时等于 `created_at`；参与者重新签发/撤销，以及任务状态、授权、统计或校验元数据实际变化时刷新为 UTC 时间。空更新、写入相同值、重复创建和重复完成等幂等操作不会改变 `updated_at`；事务回滚时更新时间一并回滚。PostgreSQL 使用 `TIMESTAMPTZ`，SQLite 使用带时区的 ISO 时间文本。
-
-服务启动或发放身份时会在同一初始化事务中幂等补齐旧表字段和触发器。参与者历史行按 `revoked_at` 或 `created_at` 回填，任务历史行按 `completed_at`、`upload_confirmed_at`、`consented_at`、`created_at` 依次取已有值；未知的历史修改时间无法还原，回填值不代表完整历史审计。重复初始化不会重置已有 `updated_at`。PostgreSQL 的初始化通过事务级 advisory lock 串行化，支持多个 API 节点同时启动。
-
-## 临时使用 SQLite
-
-编辑服务端仓库的 `.env`：
+编辑 `.env`，本地只需要先启用 SQLite，并填入一份仅供开发的 pepper 和 OSS 占位配置：
 
 ```dotenv
 TRACE_DOCK_DEV=1
 DATABASE_URL=sqlite:////tmp/trace-dock-server.db
+TOKEN_PEPPER=dev-only-random-value-with-at-least-32-characters
+HTTP_HOST=127.0.0.1
+HTTP_PORT=8080
+OSS_ENDPOINT=https://oss-cn-hangzhou.aliyuncs.com
+OSS_BUCKET=local-placeholder
+OSS_ROLE_ARN=acs:ram::local:role/placeholder
+ALIYUN_REGION=cn-hangzhou
+ALIYUN_ACCESS_KEY_ID=local-placeholder
+ALIYUN_ACCESS_KEY_SECRET=local-placeholder
 ```
 
-`TRACE_DOCK_DEV=1` 是 SQLite 的显式开关；数据库文件不存在时服务端会自动创建表。`pydantic-settings` 会自动读取服务端仓库根目录的 `.env`，并允许同名进程环境变量覆盖文件配置；也可以用 `TRACE_DOCK_ENV_FILE=/path/to/server.env` 指定其他配置文件。无需启动前手动导出变量。SQLite 只用于单进程临时验证，不用于两台 API 节点或生产数据。
+SQLite 只适合单进程验证身份和 API 流程。要实际上传和校验对象，仍需替换为有效的 OSS bucket、RAM 凭据和 STS role。
 
-参与者 token 仍通过服务端命令生成：
+### 3. 启动服务
+
+以下入口等价：
+
+```bash
+.venv/bin/trace-dock-server
+# 或
+.venv/bin/python -m trace_dock_server
+# 或
+.venv/bin/python main.py
+```
+
+确认服务可用：
+
+```bash
+curl -fsS http://127.0.0.1:8080/healthz
+```
+
+预期返回：
+
+```json
+{"status":"ok"}
+```
+
+### 4. 创建参与者 token
+
+每个参与者使用一个 token。`issue` 只在标准输出显示新 token 一次；同一邮箱再次 `issue` 会使旧 token 失效。
 
 ```bash
 .venv/bin/trace-dock-participants issue person@example.com
+```
+
+安全地把输出中的 token 交给本人。撤销身份：
+
+```bash
 .venv/bin/trace-dock-participants revoke person@example.com
 ```
 
-使用真实配置验证 STS、OSS v2 写入、读取和删除权限：
+### 5. 连接 CLI
+
+CLI 当前通过 npm 全局安装：
 
 ```bash
-.venv/bin/trace-dock-verify-oss
+npm install -g @pjlab/trace-dock
+trace-dock --allow-http --server http://127.0.0.1:8080
 ```
 
-脚本只写入并删除一个随机 healthcheck 对象，路径遵循 `trajectory/token=<token>/dt=<yyyy-MM-dd>/job=healthcheck-<随机ID>/`；可用 `VERIFY_OSS_TOKEN` 指定测试路径中的 token，不会输出 AK、SK、STS 或完整 token。
+`--allow-http` 只用于本机测试。生产服务必须通过 HTTPS 访问。
 
-API 契约详见 CLI 仓库的 `docs/API-MVP.md`：身份验证、创建任务、PATCH 状态、STS credentials、complete 五类接口，以及 `GET /healthz`。最终确认前拒绝签发 STS。服务端只下载小型 `manifest.json` 以获取对象列表，并通过 `HeadObject` 比较每个对象的大小和 OSS CRC64，不下载轨迹、workspace 或 JSONL 清单正文。同一任务重复完成不重复计数。可选设置 `OSS_READ_ENDPOINT` 为仅供服务端读取的 OSS endpoint；同地域 ECS 可使用 OSS 内网 endpoint，CLI 仍通过 `OSS_ENDPOINT` 获得公网直传地址。
+## 生产部署
 
-生产部署使用两台无状态 API 节点，共享 PostgreSQL、OSS、TOKEN_PEPPER 和身份名单，放在终止 HTTPS 的负载均衡后，API 私网端口不直接对外开放。网关须关闭 Authorization/body 日志、限制 JSON 请求到 64 KiB、配置共享的认证限流（建议每 IP 每分钟 20 次）、设置 complete 的请求超时到 30 分钟，并根据 `/healthz` 摘除故障节点。进程内认证限流仅作单节点补充，不依赖转发头。默认监听 `127.0.0.1:8080`，同机反向代理可直接使用；独立负载均衡按私网部署设置 `HTTP_HOST` 和防火墙规则。
+生产环境使用 PostgreSQL 和外部 OSS，不使用 SQLite。推荐链路为：
 
-OSS 必须使用私有 bucket 和 HTTPS。服务端通过阿里云官方 OSS Python SDK v2 读取和校验对象，通过官方 STS Python SDK 获取临时凭证；代码不包含手写 OSS/STS 签名。对象键统一为 `trajectory/token=<token>/dt=<yyyy-MM-dd>/job=<job-id>/` 前缀，任务下的 manifest、轨迹、workspace 和清单都写在该前缀内。服务端账号需要读取当前前缀，以及对 `OSS_ROLE_ARN` 执行 `sts:AssumeRole`；session policy 只允许当前 Job 前缀的 PutObject、GetObject、ListParts、AbortMultipartUpload。STS 有效期 1 小时，CLI 到期重新申请，不落盘。不要给匿名用户 bucket 读写权限。region 默认 `cn-hangzhou`，endpoint、role 和 region 须与实际云环境一致。
+```text
+Trace Dock CLI → HTTPS Nginx / ALB → API 容器 → PostgreSQL
+                                      ↘ 私有 OSS
+```
 
-`OSS_READ_ENDPOINT` 仅改变 API 节点读取对象元数据时使用的 endpoint，不改变返回给 CLI 的 `OSS_ENDPOINT`。API 节点部署在 bucket 同地域 ECS 时，可设置 OSS 内网 endpoint；不在该内网的开发机应留空。对象完整性校验采用 `Content-Length` 和 `x-oss-hash-crc64ecma`，服务端不重新下载对象正文。
+API 节点是无状态的；多个节点必须共享同一个 PostgreSQL、OSS bucket、参与者名单和 `TOKEN_PEPPER`。
 
-规则在 `trace_dock_server/rules.json`，包含分类/密钥/大文件版本、白名单、黑名单和体积阈值。每次任务创建时冻结规则，之后修改默认规则不会改变已有 Job。发布新版本前须同步 CLI 适配器及技术方案，原始需求文档保留原文，不应直接提高某个旧版本的含义。
+### 1. 准备生产配置
 
-## 真实配置
+```bash
+cp .env.production.example .env.production
+chmod 600 .env.production
+```
 
-真实部署时仍编辑服务端仓库的 `.env`，将临时 SQLite 配置改为 PostgreSQL，并填写稳定的 pepper、OSS bucket 和 RAM/STS 参数：
+编辑 `.env.production`，替换所有 `CHANGE_ME`。不要给值加引号，Compose 会按原值读取。数据库密码中的 `@`、`#`、`:`、`/` 等字符需要先进行 URL 编码。
+
+至少需要配置：
 
 ```dotenv
 TRACE_DOCK_DEV=0
-DATABASE_URL=postgresql://trace_dock:<password>@<postgres-host>:5432/trace_dock
-TOKEN_PEPPER=<密钥管理系统提供的随机值，至少 32 字符>
-HTTP_HOST=127.0.0.1
+DATABASE_URL=postgresql://trace_dock:<password>@<postgres-host>:5432/trace_dock?sslmode=require
+TOKEN_PEPPER=<稳定且随机的值，至少 32 字符>
+HTTP_HOST=0.0.0.0
 HTTP_PORT=8080
 OSS_ENDPOINT=https://oss-cn-hangzhou.aliyuncs.com
 OSS_BUCKET=<私有 bucket>
@@ -97,10 +142,147 @@ ALIYUN_ACCESS_KEY_ID=<服务端 RAM 账号>
 ALIYUN_ACCESS_KEY_SECRET=<服务端 RAM 密钥>
 ```
 
-本机直接运行时，修改 `.env` 后重启服务端即可重新加载配置。Compose 部署读取 `.env.production`，修改后需 `docker compose up -d --force-recreate api` 重新创建容器。生产 API 放在 HTTPS 负载均衡之后；本机默认监听 `127.0.0.1:8080`，容器内监听 `0.0.0.0:8080`。`TOKEN_PEPPER` 在所有 API 节点必须一致，不能轮换成新值而不迁移既有 token。OSS bucket 应保持私有，STS role 只允许当前 `trajectory/token=<token>/dt=<yyyy-MM-dd>/job=<job-id>/` 前缀。
+生成 pepper 的示例：
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 ```
 
-生产 PostgreSQL、真实 OSS/STS、网关双节点故障切换和三平台完整交互需要在部署环境验收。
+`TOKEN_PEPPER` 必须在所有 API 节点保持一致。不要在更新过程中随意更换，否则既有 token 将无法验证。
+
+### 2. 构建并启动容器
+
+```bash
+docker compose version
+docker compose config --quiet
+docker compose build api
+docker compose up -d api
+docker compose ps
+curl -fsS http://127.0.0.1:8080/healthz
+```
+
+Compose 默认只把容器端口绑定到宿主机 `127.0.0.1:8080`，适合由同机 Nginx 转发。PostgreSQL 地址不能填容器内的 `127.0.0.1`，应填写 RDS 私网地址或容器可达的数据库地址。
+
+镜像以非 root 用户运行，使用只读根文件系统，容器重建不会丢失 PostgreSQL 中的身份和任务数据。不要把 `.env.production`、token、AK/SK 或数据库密码复制进镜像。
+
+### 3. 配置 HTTPS
+
+不要把 API 的 HTTP 端口直接暴露给公网。将 `deploy/nginx.conf.example` 配置到 Nginx，替换域名和证书路径，然后检查并重载：
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+curl -fsS https://collector.example.com/healthz
+```
+
+生产反向代理应关闭 `Authorization` 和请求正文日志，并将长时间的 `/complete` 校验请求超时设置为至少 30 分钟。完整的 ECS、RDS、OSS、Nginx、ALB 和双节点更新步骤见 [ECS Docker 部署说明](docs/DEPLOY-ECS.md)。
+
+### 4. 验证云权限
+
+发放测试身份并验证 OSS 的写入、读取和删除权限：
+
+```bash
+docker compose run --rm --no-deps api trace-dock-participants issue person@example.com
+docker compose run --rm --no-deps api trace-dock-verify-oss
+```
+
+`trace-dock-verify-oss` 只创建并删除一个随机 healthcheck 对象。可以设置 `VERIFY_OSS_TOKEN` 指定测试路径中的 token，但不要把完整 token 或云凭据写进命令历史。
+
+## 配置参考
+
+| 变量 | 用途 |
+| --- | --- |
+| `TRACE_DOCK_DEV` | 设为 `1` 才允许 SQLite；生产设为 `0` |
+| `TRACE_DOCK_ENV_FILE` | 指定配置文件路径 |
+| `DATABASE_URL` | PostgreSQL 或开发用 SQLite 连接串 |
+| `TOKEN_PEPPER` | token 哈希 pepper，至少 32 字符，所有节点必须一致 |
+| `HTTP_HOST` / `HTTP_PORT` | API 监听地址和端口；容器通常为 `0.0.0.0:8080` |
+| `OSS_ENDPOINT` | 返回给 CLI 直传使用的 HTTPS endpoint |
+| `OSS_READ_ENDPOINT` | 服务端读取 OSS 元数据的可选 endpoint；同地域 ECS 可使用内网地址 |
+| `OSS_BUCKET` | 私有 OSS bucket |
+| `OSS_ROLE_ARN` | 用于签发当前 Job 前缀临时凭证的 RAM role |
+| `ALIYUN_REGION` | OSS / STS 地域，默认 `cn-hangzhou` |
+| `ALIYUN_ACCESS_KEY_ID` / `ALIYUN_ACCESS_KEY_SECRET` | 服务端 RAM 凭据 |
+| `VERIFY_OSS_TOKEN` | 可选的 OSS healthcheck 路径 token |
+
+API 节点不应设置无法访问的 `OSS_READ_ENDPOINT`。该变量只影响服务端读取对象大小和 CRC64，不改变返回给 CLI 的 `OSS_ENDPOINT`。
+
+## API 与日常操作
+
+### 健康检查
+
+```bash
+curl -fsS https://collector.example.com/healthz
+```
+
+开发或内网环境可以直接打开自动生成的接口文档：
+
+- Swagger UI：`https://collector.example.com/docs`
+- ReDoc：`https://collector.example.com/redoc`
+- OpenAPI JSON：`https://collector.example.com/openapi.json`
+
+文档会显示请求体字段、类型、必填项、枚举和 Bearer 认证方式。生产环境请只在受保护的内网或管理入口开放这些页面。
+
+### 主要接口
+
+CLI 使用 Bearer token 调用以下控制面接口：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/healthz` | 健康检查，不需要 token |
+| `POST` | `/v1/identity/verify` | 验证参与者身份 |
+| `POST` | `/v1/collections` | 创建或幂等恢复任务 |
+| `PATCH` | `/v1/collections/{job_id}` | 更新选择、授权和上传状态 |
+| `POST` | `/v1/collections/{job_id}/credentials` | 获取当前 Job 的临时 OSS 凭证 |
+| `POST` | `/v1/collections/{job_id}/complete` | 校验 manifest 和上传对象并完成任务 |
+
+API 不接收轨迹或 workspace 文件上传，控制请求正文上限为 64 KiB，也不接受带 query string 的请求。完整 JSON 字段和状态流转见 CLI 仓库的 [API-MVP.md](../trace-dock/docs/API-MVP.md)。
+
+其中 `/v1/identity/verify` 和 `/v1/collections/{job_id}/credentials` 只需要 Bearer token 和路径参数，不需要请求体。
+
+### 日志、更新与回滚
+
+```bash
+docker compose logs --tail=100 api
+docker compose build api
+docker compose up -d --force-recreate api
+```
+
+更新多节点时，先从负载均衡摘除一个节点，等待正在执行的校验完成，再更新并恢复流量；另一节点按相同步骤处理。不要在更新期间更换 `TOKEN_PEPPER`。
+
+## 安全注意事项
+
+- 生产 API 只通过 HTTPS 暴露，API 容器端口保持私网或回环绑定。
+- OSS bucket 必须是私有 bucket；STS policy 只允许当前 Job 前缀的必要操作。
+- 不要记录或转发 `Authorization`、token、`TOKEN_PEPPER`、AK/SK、数据库密码、`.env.production` 或 `docker compose config` 的完整输出。
+- token 数据库存储为 pepper 哈希，原始 token 只在 `issue` 命令输出一次。
+- 当前实现会把原始 token 放入 OSS 对象前缀和完成回执中的对象路径。请把对象 key、manifest 和 receipt 当作敏感数据，不要公开；正式生产上线前应完成凭据路径改造。
+- 规则在任务创建时冻结。更新 `trace_dock_server/rules.json` 后重启服务端，新规则只对新建任务生效。
+
+## 常见问题
+
+### 启动时报配置错误
+
+检查 `.env` 是否包含全部必填项，`TOKEN_PEPPER` 是否至少 32 字符，`DATABASE_URL` 是否为 PostgreSQL；SQLite 只有在 `TRACE_DOCK_DEV=1` 时才允许使用。
+
+### `/healthz` 正常但上传失败
+
+健康检查只证明 API 进程能响应，不验证 OSS 或 STS。运行 `trace-dock-verify-oss`，检查 bucket、endpoint、region、RAM 凭据和 `OSS_ROLE_ARN` 的权限。
+
+### token 无法验证
+
+确认 CLI 使用的是最近一次 `issue` 输出的 token。对同一邮箱重新 `issue` 会撤销之前的 token；多节点部署时确认所有节点使用同一个 `TOKEN_PEPPER` 和数据库。
+
+### Docker 启动后连接不到数据库
+
+容器中的 `127.0.0.1` 指向容器本身。将 `DATABASE_URL` 改为 RDS 私网域名、Docker 网络中的数据库服务名或其他容器可达地址。
+
+## 开发与测试
+
+运行单元测试：
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+发布前还应在目标云环境验证真实 PostgreSQL、OSS/STS、HTTPS 证书、长时间 complete 校验和多节点切换。部署细节见 [ECS Docker 部署说明](docs/DEPLOY-ECS.md)。

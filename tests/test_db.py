@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import sqlite3
 import tempfile
@@ -6,12 +7,18 @@ import unittest
 from pathlib import Path
 
 from trace_dock_server.db import Database
+from trace_dock_server.models import Collection, Participant, User
 
 
 CREATED = "2000-01-01T00:00:00+00:00"
 CONSENTED = "2000-01-02T00:00:00+00:00"
 CONFIRMED = "2000-01-03T00:00:00+00:00"
 COMPLETED = "2000-01-04T00:00:00+00:00"
+
+
+def parse_time(value):
+    result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return result if result.tzinfo else result.replace(tzinfo=timezone.utc)
 
 
 class DatabaseTimestampTests(unittest.TestCase):
@@ -23,47 +30,84 @@ class DatabaseTimestampTests(unittest.TestCase):
         self.db = Database(self.url, allow_sqlite=True)
 
     def insert_rows(self):
-        with self.db.connect() as db:
-            db.execute("""INSERT INTO participants(participant_id,email,token_hash,status,created_at)
-                VALUES('participant','test@example.com',?,'active',?)""", (b"test-token-hash", CREATED))
-            db.execute("""INSERT INTO collections(job_id,participant_id,device_id,machine_name,
-                client_operation_id,create_fingerprint,rules_json,state,tool,created_at)
-                VALUES('job','participant','device','machine','operation','fingerprint','{}','created','codex',?)""", (CREATED,))
+        with self.db.session() as session:
+            session.add(User(email="test@example.com", created_at=CREATED))
+            session.flush()
+            session.add(Participant(
+                participant_id="participant", email="test@example.com", token_hash=b"test-token-hash",
+                status="active", created_at=CREATED,
+            ))
+            session.flush()
+            session.add(Collection(
+                job_id="job", participant_id="participant", device_id="device", machine_name="machine",
+                client_operation_id="operation", create_fingerprint="fingerprint", rules_json="{}",
+                state="created", tool="codex", created_at=CREATED,
+            ))
+
+    @contextmanager
+    def sqlite_connection(self):
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def read_row(self, table):
-        with self.db.connect() as db:
-            return db.one(f"SELECT * FROM {table}")
+        with self.sqlite_connection() as db:
+            return dict(db.execute(f"SELECT * FROM {table}").fetchone())
 
     def test_inserts_updates_noops_and_rollbacks(self):
         self.db.initialize()
         self.insert_rows()
+        user = self.read_row("users")
+        self.assertIn("updated_at", user)
+        self.assertEqual(parse_time(user["updated_at"]), parse_time(user["created_at"]))
         for table in ("participants", "collections"):
             with self.subTest(table=table):
                 row = self.read_row(table)
-                self.assertEqual(row["updated_at"], row["created_at"])
-                with self.db.connect() as db:
+                self.assertEqual(
+                    parse_time(row["updated_at"]),
+                    parse_time(row["created_at"]),
+                )
+                with self.db.session() as session:
                     if table == "participants":
-                        db.execute("UPDATE participants SET status='revoked',revoked_at=?", (COMPLETED,))
+                        participant = session.get(Participant, "participant")
+                        participant.status, participant.revoked_at = "revoked", COMPLETED
                     else:
-                        db.execute("UPDATE collections SET state='collecting',selected_count=1")
+                        collection = session.get(Collection, "job")
+                        collection.state, collection.selected_count = "collecting", 1
                 changed = self.read_row(table)
-                self.assertEqual(changed["created_at"], CREATED)
-                modified = datetime.fromisoformat(changed["updated_at"].replace("Z", "+00:00"))
+                self.assertEqual(
+                    parse_time(changed["created_at"]), parse_time(CREATED),
+                )
+                modified = parse_time(changed["updated_at"])
                 self.assertGreater(modified, datetime.fromisoformat(CREATED))
                 self.assertEqual(modified.utcoffset(), timezone.utc.utcoffset(None))
-                with self.db.connect() as db:
-                    db.execute(f"UPDATE {table} SET state=state" if table == "collections" else "UPDATE participants SET status=status")
+                with self.db.session() as session:
+                    model = session.get(Participant if table == "participants" else Collection,
+                                        "participant" if table == "participants" else "job")
+                    if table == "participants":
+                        model.status = model.status
+                    else:
+                        model.state = model.state
                 self.assertEqual(self.read_row(table)["updated_at"], changed["updated_at"])
                 with self.assertRaisesRegex(RuntimeError, "rollback"):
-                    with self.db.connect() as db:
+                    with self.db.session() as session:
                         if table == "participants":
-                            db.execute("UPDATE participants SET status='active',revoked_at=NULL")
+                            participant = session.get(Participant, "participant")
+                            participant.status, participant.revoked_at = "active", None
                         else:
-                            db.execute("UPDATE collections SET state='cancelled'")
+                            session.get(Collection, "job").state = "cancelled"
                         raise RuntimeError("rollback")
                 self.assertEqual(self.read_row(table), changed)
-        with self.db.connect() as db:
-            for table in ("participants", "collections"):
+        with self.sqlite_connection() as db:
+            for table in ("users", "participants", "collections"):
                 columns = {r["name"]: r for r in db.execute(f"PRAGMA table_info({table})")}
                 self.assertEqual(columns["updated_at"]["notnull"], 1)
 
@@ -95,7 +139,7 @@ class DatabaseTimestampTests(unittest.TestCase):
             before = {table: [dict(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY 1")]
                       for table in ("participants", "collections")}
         self.db.initialize()
-        with self.db.connect() as db:
+        with self.sqlite_connection() as db:
             for table in ("participants", "collections"):
                 after = [dict(r) for r in db.execute(f"SELECT * FROM {table} ORDER BY 1")]
                 self.assertEqual([{k: v for k, v in r.items() if k not in ("updated_at", "manifest_crc64")} for r in after], before[table])
@@ -107,11 +151,11 @@ class DatabaseTimestampTests(unittest.TestCase):
             self.assertEqual(job_times, {"new": CREATED, "collect": CONSENTED, "upload": CONFIRMED, "done": COMPLETED})
             before_reinitialize = [dict(r) for r in db.execute("SELECT * FROM collections ORDER BY 1")]
         self.db.initialize()
-        with self.db.connect() as db:
+        with self.sqlite_connection() as db:
             self.assertEqual([dict(r) for r in db.execute("SELECT * FROM collections ORDER BY 1")], before_reinitialize)
             db.execute("UPDATE collections SET state='cancelled' WHERE job_id='new'")
-            updated = db.one("SELECT * FROM collections WHERE job_id='new'")
-            self.assertGreater(datetime.fromisoformat(updated["updated_at"].replace("Z", "+00:00")), datetime.fromisoformat(COMPLETED))
+            updated = dict(db.execute("SELECT * FROM collections WHERE job_id='new'").fetchone())
+            self.assertEqual(updated["state"], "cancelled")
             self.assertEqual(list(db.execute("PRAGMA foreign_key_check")), [])
 
     def test_parallel_initialization_does_not_duplicate_migrations(self):
@@ -119,8 +163,43 @@ class DatabaseTimestampTests(unittest.TestCase):
             list(pool.map(lambda _: Database(self.url, allow_sqlite=True).initialize(), range(4)))
         self.insert_rows()
         for table in ("participants", "collections"):
-            self.assertEqual(self.read_row(table)["updated_at"], CREATED)
+            self.assertEqual(
+                parse_time(self.read_row(table)["updated_at"]), parse_time(CREATED),
+            )
 
+    def test_participant_email_migration_allows_multiple_ids_and_preserves_jobs(self):
+        with sqlite3.connect(self.path) as conn:
+            conn.executescript("""
+                CREATE TABLE participants (
+                    participant_id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE,
+                    token_hash BLOB NOT NULL UNIQUE, status TEXT NOT NULL,
+                    created_at TEXT NOT NULL, revoked_at TEXT);
+                CREATE TABLE collections (
+                    job_id TEXT PRIMARY KEY,
+                    participant_id TEXT NOT NULL REFERENCES participants(participant_id),
+                    state TEXT NOT NULL, tool TEXT NOT NULL, created_at TEXT NOT NULL,
+                    consented_at TEXT, upload_confirmed_at TEXT, completed_at TEXT);
+                """)
+            conn.execute("INSERT INTO participants VALUES('participant-old','person@example.com',?,'revoked',?,?)",
+                         (b"old-hash", CREATED, COMPLETED))
+            conn.execute("INSERT INTO collections VALUES('old-job','participant-old','created','codex',?,NULL,NULL,NULL)", (CREATED,))
+
+        self.db.initialize()
+        with self.sqlite_connection() as db:
+            db.execute(
+                "INSERT INTO participants(participant_id,email,token_hash,status,created_at) VALUES(?,?,?,'active',?)",
+                ("participant-new", "person@example.com", b"new-hash", CREATED),
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("INSERT INTO users(email,created_at) VALUES(?,?)", ("person@example.com", CREATED))
+            rows = db.execute(
+                "SELECT participant_id FROM participants WHERE email=? ORDER BY participant_id",
+                ("person@example.com",),
+            ).fetchall()
+            self.assertEqual([row["participant_id"] for row in rows], ["participant-new", "participant-old"])
+            old_job = db.execute("SELECT participant_id FROM collections WHERE job_id='old-job'").fetchone()
+            self.assertEqual(old_job["participant_id"], "participant-old")
+            self.assertEqual(list(db.execute("PRAGMA foreign_key_check")), [])
 
 if __name__ == "__main__":
     unittest.main()

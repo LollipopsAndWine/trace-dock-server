@@ -30,8 +30,6 @@ class Settings(BaseSettings):
     aliyun_region: str = "cn-hangzhou"
     aliyun_access_key_id: SecretStr = Field(min_length=1)
     aliyun_access_key_secret: SecretStr = Field(min_length=1)
-    verify_oss_token: SecretStr | None = None
-
     @model_validator(mode="after")
     def validate_settings(self):
         database_url = self.database_url.get_secret_value()

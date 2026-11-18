@@ -18,7 +18,7 @@ class FakeService:
     def create(self, participant, body, key):
         return {
             "job_id": "job",
-            "object_prefix": "trajectory/token=test/job=job/",
+            "object_prefix": "trajectory/participant_id=participant/job=job/",
             "rules": {
                 "classification_version": "1.0.0",
                 "secret_version": "2.2.0",

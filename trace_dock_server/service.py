@@ -6,7 +6,11 @@ import secrets
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from .db import COUNTERS
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+from .models import COUNTERS, Collection, Participant
 
 
 class APIError(Exception):
@@ -31,6 +35,10 @@ def iso(value):
     return value.isoformat() if isinstance(value, datetime) else value
 
 
+def record(row):
+    return {column.key: getattr(row, column.key) for column in row.__table__.columns}
+
+
 SHA = re.compile(r"^[0-9a-f]{64}$")
 CRC64 = re.compile(r"^(0|[1-9][0-9]{0,19})$")
 ID = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
@@ -38,7 +46,7 @@ TOKEN_PATH = re.compile(r"^[A-Za-z0-9_-]{16,4096}$")
 STATES = {
     "created": {"created", "collecting", "cancelled", "failed"},
     "collecting": {"collecting", "awaiting_upload_confirmation", "resumable", "cancelled", "failed"},
-    "awaiting_upload_confirmation": {"awaiting_upload_confirmation", "uploading", "cancelled", "failed"},
+    "awaiting_upload_confirmation": {"awaiting_upload_confirmation", "collecting", "uploading", "cancelled", "failed"},
     "uploading": {"uploading", "verifying", "resumable", "cancelled", "failed"},
     "verifying": {"verifying", "resumable", "completed", "failed"},
     "resumable": {"resumable", "collecting", "awaiting_upload_confirmation", "uploading", "verifying", "failed", "cancelled"},
@@ -61,20 +69,23 @@ class Service:
         token = authorization[7:]
         require(TOKEN_PATH.fullmatch(token), "unauthorized", 401)
         hashed = hmac.new(self.pepper, token.encode(), hashlib.sha256).digest()
-        with self.db.connect() as db:
-            p = db.one("SELECT * FROM participants WHERE token_hash=? AND status='active'", (hashed,))
+        with self.db.session() as session:
+            p = session.scalar(select(Participant).where(
+                Participant.token_hash == hashed, Participant.status == "active"
+            ))
         require(p is not None, "unauthorized", 401)
-        p["_token"] = token
-        return p
+        return record(p)
 
     @staticmethod
     def object_prefix(p, row):
         created = row["created_at"]
         date = created.date().isoformat() if hasattr(created, "date") else str(created)[:10]
-        return f"trajectory/token={p['_token']}/dt={date}/job={row['job_id']}/"
+        return f"trajectory/participant_id={p['participant_id']}/dt={date}/job={row['job_id']}/"
 
-    def owned(self, db, job, participant):
-        row = db.one("SELECT * FROM collections WHERE job_id=? AND participant_id=?", (job, participant), lock=True)
+    def owned(self, session, job, participant):
+        row = session.scalar(select(Collection).where(
+            Collection.job_id == job, Collection.participant_id == participant
+        ).with_for_update())
         require(row is not None, "job_not_found", 404)
         return row
 
@@ -90,23 +101,52 @@ class Service:
         fingerprint = digest_json(fields)
         job = secrets.token_hex(16)
         # ON CONFLICT and the unique constraint handle requests landing on two API nodes.
-        with self.db.connect() as db:
-            db.execute("""INSERT INTO collections(job_id,participant_id,device_id,machine_name,
-                client_operation_id,create_fingerprint,rules_json,state,tool,created_at)
-                VALUES(?,?,?,?,?,?,?,'created',?,?) ON CONFLICT(participant_id,client_operation_id) DO NOTHING""",
-                (job, p["participant_id"], fields["device_id"], fields["machine_name"], key, fingerprint, json.dumps(self.rules), fields["tool"], now()))
-            row = db.one("SELECT * FROM collections WHERE participant_id=? AND client_operation_id=?", (p["participant_id"], key), lock=True)
+        created_at = now()
+        values = dict(
+            job_id=job,
+            participant_id=p["participant_id"],
+            device_id=fields["device_id"],
+            machine_name=fields["machine_name"],
+            client_operation_id=key,
+            create_fingerprint=fingerprint,
+            rules_json=json.dumps(self.rules),
+            state="created",
+            tool=fields["tool"],
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        with self.db.session() as session:
+            insert = sqlite_insert if self.db.sqlite else pg_insert
+            session.execute(insert(Collection).values(**values).on_conflict_do_nothing(
+                index_elements=[Collection.participant_id, Collection.client_operation_id]
+            ))
+            row = session.scalar(select(Collection).where(
+                Collection.participant_id == p["participant_id"], Collection.client_operation_id == key
+            ).with_for_update())
+            row = record(row)
             require(row["create_fingerprint"] == fingerprint, "idempotency_conflict", 409)
         return {"job_id": row["job_id"], "rules": json.loads(row["rules_json"]), "object_prefix": self.object_prefix(p, row)}
 
     def patch(self, p, job, body):
         allowed = {"state", "selection_mode", "selected_count", "discovered_count", "consented_at", "upload_confirmed_at", "selection_sha256"}
         require(set(body) <= allowed, "unsupported_patch_field")
-        with self.db.connect() as db:
-            row = self.owned(db, job, p["participant_id"])
+        with self.db.session() as session:
+            model = self.owned(session, job, p["participant_id"])
+            row = record(model)
             target = body.get("state", row["state"])
             require(target in STATES[row["state"]] and target not in ("completed", "verifying"), "invalid_state_transition", 409)
             updates = dict(body)
+            if target == "collecting" and row["state"] in ("awaiting_upload_confirmation", "resumable"):
+                # Rebuilding an already selected collection requires a fresh
+                # upload confirmation and a new manifest verification record.
+                updates.update(
+                    upload_confirmed_at=None,
+                    manifest_key=None,
+                    manifest_crc64=None,
+                    manifest_size_bytes=None,
+                    uploaded_bytes=0,
+                    verified_object_count=0,
+                )
             for k in ("selected_count", "discovered_count"):
                 if k in updates:
                     require(type(updates[k]) is int and updates[k] >= 0)
@@ -124,7 +164,13 @@ class Service:
                         require(parsed.tzinfo is not None and parsed <= datetime.now(timezone.utc) + timedelta(minutes=5))
                     except (ValueError, TypeError, AttributeError):
                         raise APIError(400, "invalid_confirmation_time")
-                    require(row[k] is None or iso(row[k]).replace("+00:00", "Z") == body[k].replace("+00:00", "Z"), "confirmation_frozen", 409)
+                    if row[k] is not None:
+                        # PostgreSQL returns aware datetime values in the
+                        # session timezone; Go may also omit fractional zeros.
+                        # Freeze the instant, not its textual representation.
+                        frozen = row[k] if isinstance(row[k], datetime) else datetime.fromisoformat(row[k].replace("Z", "+00:00"))
+                        require(frozen == parsed, "confirmation_frozen", 409)
+                        updates[k] = row[k]
             merged = row | updates
             require(merged["selected_count"] <= merged["discovered_count"])
             if target == "collecting":
@@ -133,32 +179,35 @@ class Service:
                 require(row["state"] in ("awaiting_upload_confirmation", "uploading", "resumable"), "collection_not_ready", 409)
             if target == "uploading":
                 require(merged["consented_at"] and merged["upload_confirmed_at"] and row["state"] != "collecting", "upload_confirmation_required", 409)
-            if updates:
-                names = list(updates)
-                db.execute("UPDATE collections SET " + ",".join(k + "=?" for k in names) + " WHERE job_id=?", tuple(updates[k] for k in names) + (job,))
+            for name, value in updates.items():
+                setattr(model, name, value)
         return {"job_id": job, "state": target}
 
     def credentials(self, p, job):
-        with self.db.connect() as db:
-            row = self.owned(db, job, p["participant_id"])
+        with self.db.session() as session:
+            row = record(self.owned(session, job, p["participant_id"]))
             require(row["upload_confirmed_at"] is not None and row["state"] in ("uploading", "resumable", "verifying"), "upload_confirmation_required", 409)
         return self.storage.credentials(job, self.object_prefix(p, row))
 
     def complete(self, p, job, body):
         key, crc64, size = body.get("manifest_key"), body.get("manifest_crc64"), body.get("manifest_size_bytes")
-        with self.db.connect() as db:
-            prefix_row = self.owned(db, job, p["participant_id"])
+        with self.db.session() as session:
+            prefix_row = record(self.owned(session, job, p["participant_id"]))
         prefix = self.object_prefix(p, prefix_row)
         require(key == prefix+"manifest.json" and isinstance(crc64, str) and CRC64.fullmatch(crc64) and int(crc64) <= 18446744073709551615 and type(size) is int and size > 0)
-        with self.db.connect() as db:
-            row = self.owned(db, job, p["participant_id"])
+        with self.db.session() as session:
+            model = self.owned(session, job, p["participant_id"])
+            row = record(model)
             require(row["upload_confirmed_at"] and row["state"] in ("uploading", "verifying", "resumable", "completed"), "upload_confirmation_required", 409)
             if row["manifest_crc64"] is not None:
                 require(row["manifest_crc64"] == crc64 and row["manifest_size_bytes"] == size, "manifest_conflict", 409)
             if row["state"] == "completed":
                 require(row["manifest_crc64"] is not None, "legacy_task_not_supported", 409)
                 return self.receipt(row, prefix)
-            db.execute("UPDATE collections SET state='verifying',manifest_key=?,manifest_crc64=?,manifest_size_bytes=? WHERE job_id=?", (key, crc64, size, job))
+            model.state = "verifying"
+            model.manifest_key = key
+            model.manifest_crc64 = crc64
+            model.manifest_size_bytes = size
         try:
             manifest = self.storage.read_manifest(key, size, crc64)
             summary, objects = self.validate_manifest(manifest, row, prefix)
@@ -166,28 +215,33 @@ class Service:
             for artifact in objects:
                 self.storage.verify(artifact["object_key"], artifact["size_bytes"], artifact["crc64"])
         except (ValueError, KeyError, TypeError):
-            with self.db.connect() as db:
-                self.owned(db, job, p["participant_id"])
-                db.execute("UPDATE collections SET state='resumable' WHERE job_id=? AND state='verifying'", (job,))
+            with self.db.session() as session:
+                model = self.owned(session, job, p["participant_id"])
+                if model.state == "verifying":
+                    model.state = "resumable"
             raise APIError(422, "manifest_or_object_verification_failed")
-        with self.db.connect() as db:
-            current = self.owned(db, job, p["participant_id"])
+        with self.db.session() as session:
+            current_model = self.owned(session, job, p["participant_id"])
+            current = record(current_model)
             if current["state"] == "completed":
                 return self.receipt(current, prefix)
             require(current["state"] == "verifying", "invalid_state_transition", 409)
             counts = {k: summary[k] for k in COUNTERS if k in summary and k not in ("discovered_count", "uploaded_bytes", "verified_object_count")}
             counts.update(uploaded_bytes=total, verified_object_count=len(objects) + 1)
-            names = list(counts)
-            db.execute("UPDATE collections SET state='completed',completed_at=?," + ",".join(k + "=?" for k in names) + " WHERE job_id=?", (now(),) + tuple(counts[k] for k in names) + (job,))
-            return self.receipt(self.owned(db, job, p["participant_id"]), prefix)
+            current_model.state = "completed"
+            current_model.completed_at = now()
+            for name, value in counts.items():
+                setattr(current_model, name, value)
+            session.flush()
+            return self.receipt(record(current_model), prefix)
 
     def validate_manifest(self, m, row, prefix):
         def check(condition):
             if not condition:
                 raise ValueError("invalid_manifest")
-        check(m["manifest_schema"] == "1.1" and m["job_id"] == row["job_id"] and m["participant_id"] == row["participant_id"])
+        check(m["manifest_schema"] == "1.2" and m["job_id"] == row["job_id"] and m["participant_id"] == row["participant_id"])
         check(m["device_id"] == row["device_id"] and m["machine_name"] == row["machine_name"] and m["tool"] == row["tool"])
-        check(m["object_prefix"] == prefix and m["object_prefix"].startswith("trajectory/token=") and m["object_prefix"].endswith("/"))
+        check(m["object_prefix"] == prefix and m["object_prefix"].startswith(f"trajectory/participant_id={row['participant_id']}/") and m["object_prefix"].endswith("/"))
         check(m["rules"] == json.loads(row["rules_json"]) and m["selection_mode"] == row["selection_mode"])
         for field in ("consented_at", "upload_confirmed_at"):
             check(datetime.fromisoformat(m[field].replace("Z", "+00:00")) == datetime.fromisoformat(iso(row[field]).replace("Z", "+00:00")))

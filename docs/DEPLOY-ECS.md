@@ -58,7 +58,7 @@ curl -fsS http://127.0.0.1:8080/healthz
 ## 4. 发放身份与验证 OSS
 
 ```bash
-# 仅当次在终端显示新 token；重新 issue 同一邮箱会撤销旧 token
+# 仅当次显示新 token 和 participant ID；同一邮箱可同时有多个活动 token
 docker compose run --rm --no-deps api trace-dock-participants issue person@example.com
 
 # 单独撤销
@@ -68,7 +68,11 @@ docker compose run --rm --no-deps api trace-dock-participants revoke person@exam
 docker compose run --rm --no-deps api trace-dock-verify-oss
 ```
 
+邮箱在 `users` 表唯一，`participants.email` 是关联外键；每条 participant 记录各自对应一个 token 和 participant ID。服务启动会将旧 participants 邮箱迁移至 users，并移除旧邮箱唯一约束；SQLite 与 PostgreSQL 迁移都会保留现有 participant ID 和 collections 外键。
+
 token 通过受控渠道交付本人，不写进 Dockerfile 或镜像。不要把 `docker compose config` 的完整输出保存或转发，其中可能包含运行时凭据；校验配置使用前述 `--quiet`。
+
+新 token 加密携带邮箱。数据库不可用时，仍可用 `TOKEN_PEPPER` 通过 `.venv/bin/trace-dock-token-email` 恢复邮箱；该命令只需 pepper，不连接数据库。请将 `TOKEN_PEPPER` 纳入安全备份。
 
 ## 5. HTTPS 域名与 Nginx
 
@@ -128,4 +132,4 @@ docker compose stop api
 
 双节点更新时，先从负载均衡摘除一个节点，等其正在执行的校验完成，再更新该节点并重新挂回；另一节点按相同步骤处理。Compose 保留 35 分钟退出宽限，避免用 Docker 默认短超时中断长校验。不要在更新中更换 `TOKEN_PEPPER`；大文件/扫描规则变化只作用于新建任务，已有任务保持冻结规则。
 
-当前参与者 token 仍出现在 OSS 对象路径、manifest 前缀及数据库 manifest_key 中。容器化不会改变这一已知行为，正式生产上线前需要完成凭据路径调整。真实 RDS/OSS、HTTPS 证书、ALB 超时和双节点切换须在目标阿里云环境验证。
+新任务的 OSS 对象路径使用稳定随机 `participant_id`，不会包含 Bearer token 或邮箱。升级后旧 manifest 1.1 任务需重新创建，旧 OSS 对象不会自动迁移或删除；如果旧 key 曾公开，应轮换相关 token，并按保留策略清理旧对象。真实 RDS/OSS、HTTPS 证书、ALB 超时和双节点切换须在目标阿里云环境验证。

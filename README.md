@@ -81,19 +81,40 @@ curl -fsS http://127.0.0.1:8080/healthz
 {"status":"ok"}
 ```
 
+### 数据库结构变更
+
+表结构统一定义在 `trace_dock_server/models.py`。服务启动时会运行 Alembic 升级；新数据库由模型创建完整表结构，已有数据库按迁移版本补齐。应用读写使用 SQLAlchemy ORM。
+
+新增字段或表时，先更新模型，再生成并检查迁移：
+
+```bash
+.venv/bin/alembic revision --autogenerate -m "add user profile field"
+.venv/bin/alembic upgrade head
+```
+
+提交模型和生成的迁移文件。部署启动时会自动执行 `upgrade head`，不需要再在数据库启动代码里为字段增加单独分支。
+
 ### 4. 创建参与者 token
 
-每个参与者使用一个 token。`issue` 只在标准输出显示新 token 一次；同一邮箱再次 `issue` 会使旧 token 失效。
+数据关系是：`users.email` 唯一；`participants` 每行对应一个 token 和一个 participant ID，并通过 email 外键关联 user。因此一个邮箱可以同时有多个活动 token。每次 `issue` 创建新的 token / participant ID，只在标准输出显示新 token 一次，不影响同邮箱之前签发的 token。`revoke` 会撤销该邮箱的所有活动 token，历史记录仍保留。
 
 ```bash
 .venv/bin/trace-dock-participants issue person@example.com
 ```
 
-安全地把输出中的 token 交给本人。撤销身份：
+安全地把输出中的 token 和 participant ID 交给本人。撤销该邮箱下所有活动 token：
 
 ```bash
 .venv/bin/trace-dock-participants revoke person@example.com
 ```
+
+新签发的 token 加密携带邮箱。数据库不可用时，可用保存的 `TOKEN_PEPPER` 从 token 恢复邮箱，不需要连接数据库：
+
+```bash
+.venv/bin/trace-dock-token-email
+```
+
+命令会隐藏式提示输入 token，只输出邮箱。旧格式 token 不包含邮箱，不能恢复。
 
 ### 5. 连接 CLI
 
@@ -148,7 +169,7 @@ ALIYUN_ACCESS_KEY_SECRET=<服务端 RAM 密钥>
 python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 ```
 
-`TOKEN_PEPPER` 必须在所有 API 节点保持一致。不要在更新过程中随意更换，否则既有 token 将无法验证。
+`TOKEN_PEPPER` 必须在所有 API 节点保持一致并妥善备份。它用于验证 token，也用于解密新 token 中的邮箱；丢失后既有 token 无法验证，也无法从新 token 恢复邮箱。不要在更新过程中随意更换。
 
 ### 2. 构建并启动容器
 
@@ -186,7 +207,7 @@ docker compose run --rm --no-deps api trace-dock-participants issue person@examp
 docker compose run --rm --no-deps api trace-dock-verify-oss
 ```
 
-`trace-dock-verify-oss` 只创建并删除一个随机 healthcheck 对象。可以设置 `VERIFY_OSS_TOKEN` 指定测试路径中的 token，但不要把完整 token 或云凭据写进命令历史。
+`trace-dock-verify-oss` 只创建并删除一个随机 healthcheck 对象，使用独立的随机 healthcheck participant ID，不使用参与者 Bearer token。
 
 ## 配置参考
 
@@ -195,7 +216,7 @@ docker compose run --rm --no-deps api trace-dock-verify-oss
 | `TRACE_DOCK_DEV` | 设为 `1` 才允许 SQLite；生产设为 `0` |
 | `TRACE_DOCK_ENV_FILE` | 指定配置文件路径 |
 | `DATABASE_URL` | PostgreSQL 或开发用 SQLite 连接串 |
-| `TOKEN_PEPPER` | token 哈希 pepper，至少 32 字符，所有节点必须一致 |
+| `TOKEN_PEPPER` | token 校验和邮箱恢复密钥，至少 32 字符，所有节点必须一致并备份 |
 | `HTTP_HOST` / `HTTP_PORT` | API 监听地址和端口；容器通常为 `0.0.0.0:8080` |
 | `OSS_ENDPOINT` | 返回给 CLI 直传使用的 HTTPS endpoint |
 | `OSS_READ_ENDPOINT` | 服务端读取 OSS 元数据的可选 endpoint；同地域 ECS 可使用内网地址 |
@@ -203,7 +224,6 @@ docker compose run --rm --no-deps api trace-dock-verify-oss
 | `OSS_ROLE_ARN` | 用于签发当前 Job 前缀临时凭证的 RAM role |
 | `ALIYUN_REGION` | OSS / STS 地域，默认 `cn-hangzhou` |
 | `ALIYUN_ACCESS_KEY_ID` / `ALIYUN_ACCESS_KEY_SECRET` | 服务端 RAM 凭据 |
-| `VERIFY_OSS_TOKEN` | 可选的 OSS healthcheck 路径 token |
 
 API 节点不应设置无法访问的 `OSS_READ_ENDPOINT`。该变量只影响服务端读取对象大小和 CRC64，不改变返回给 CLI 的 `OSS_ENDPOINT`。
 
@@ -238,7 +258,7 @@ CLI 使用 Bearer token 调用以下控制面接口：
 
 API 不接收轨迹或 workspace 文件上传，控制请求正文上限为 64 KiB，也不接受带 query string 的请求。完整 JSON 字段和状态流转见 CLI 仓库的 [API-MVP.md](../trace-dock/docs/API-MVP.md)。
 
-其中 `/v1/identity/verify` 和 `/v1/collections/{job_id}/credentials` 只需要 Bearer token 和路径参数，不需要请求体。
+其中 `/v1/identity/verify` 和 `/v1/collections/{job_id}/credentials` 只需要 Bearer token 和路径参数，不需要请求体。新任务的 OSS 路径格式为 `trajectory/participant_id=<participant_id>/dt=<date>/job=<job_id>/`，不含邮箱或 Bearer token；manifest schema 1.1 任务需重新创建。
 
 ### 日志、更新与回滚
 
@@ -255,8 +275,8 @@ docker compose up -d --force-recreate api
 - 生产 API 只通过 HTTPS 暴露，API 容器端口保持私网或回环绑定。
 - OSS bucket 必须是私有 bucket；STS policy 只允许当前 Job 前缀的必要操作。
 - 不要记录或转发 `Authorization`、token、`TOKEN_PEPPER`、AK/SK、数据库密码、`.env.production` 或 `docker compose config` 的完整输出。
-- token 数据库存储为 pepper 哈希，原始 token 只在 `issue` 命令输出一次。
-- 当前实现会把原始 token 放入 OSS 对象前缀和完成回执中的对象路径。请把对象 key、manifest 和 receipt 当作敏感数据，不要公开；正式生产上线前应完成凭据路径改造。
+- users 表保证邮箱唯一；participants 的每行通过 email 外键关联一个 user，并各自对应一个 token 和 participant ID。token 在数据库中保存为 pepper HMAC；新 token 加密携带邮箱，只有持有 `TOKEN_PEPPER` 才能恢复，原文只在 `issue` 命令输出一次。
+- 同一邮箱每次签发会新建 participant ID，已有 token 保持有效；`revoke <email>` 会撤销该邮箱所有活动 token。新任务使用 `trajectory/participant_id=<participant_id>/...` OSS 前缀，该 ID 不是认证凭据。已存在的旧对象不会自动搬迁或删除；若旧 key 曾被公开，需轮换相关 token 并按存储保留策略清理旧对象。
 - 规则在任务创建时冻结。更新 `trace_dock_server/rules.json` 后重启服务端，新规则只对新建任务生效。
 
 ## 常见问题
@@ -271,7 +291,7 @@ docker compose up -d --force-recreate api
 
 ### token 无法验证
 
-确认 CLI 使用的是最近一次 `issue` 输出的 token。对同一邮箱重新 `issue` 会撤销之前的 token；多节点部署时确认所有节点使用同一个 `TOKEN_PEPPER` 和数据库。
+确认 CLI 使用的是仍有效的 `issue` token。一个邮箱签发的多个 token 可分别使用；`revoke <email>` 会全部撤销。多节点部署时确认所有节点使用同一个 `TOKEN_PEPPER` 和数据库。
 
 ### Docker 启动后连接不到数据库
 

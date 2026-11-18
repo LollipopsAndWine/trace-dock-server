@@ -105,7 +105,7 @@ class CompleteCollectionRequest(APIModel):
         title="完成采集任务请求",
         json_schema_extra={
             "examples": [{
-                "manifest_key": "trajectory/token=example-token-1234567890/dt=2026-11-17/job=job-example-123/manifest.json",
+                "manifest_key": "trajectory/participant_id=8f2c7d1a4e6b409fa3d5c8127096be34/dt=2026-11-17/job=job-example-123/manifest.json",
                 "manifest_crc64": "1234567890",
                 "manifest_size_bytes": 12345,
             }],
@@ -135,7 +135,7 @@ class HealthResponse(BaseModel):
 class IdentityResponse(BaseModel):
     model_config = ConfigDict(title="身份验证响应")
 
-    participant_id: str = Field(description="服务端分配的参与者 ID，不是邮箱地址。")
+    participant_id: str = Field(description="当前 Bearer token 对应的唯一 participant ID；一个邮箱可关联多条 participant 记录。")
     masked_email: str = Field(description="脱敏后的邮箱，仅用于让用户确认当前身份。")
 
 
@@ -156,7 +156,7 @@ class CreateCollectionResponse(BaseModel):
 
     job_id: str = Field(description="本次采集任务 ID。")
     rules: RulesResponse = Field(description="创建任务时冻结的采集规则。")
-    object_prefix: str = Field(description="当前任务的 OSS 对象前缀；包含敏感路径信息。")
+    object_prefix: str = Field(description="按稳定参与者 ID 隔离的当前任务 OSS 前缀；不包含邮箱或 Bearer token。")
 
 
 class CollectionPatchResponse(BaseModel):
@@ -202,7 +202,7 @@ class CompleteCollectionResponse(BaseModel):
     participant_id: str = Field(description="参与者 ID。")
     state: Literal["completed"] = Field(description="任务最终状态。")
     verification: Literal["crc64_verified"] = Field(description="对象完整性校验结果。")
-    object_prefix: str = Field(description="任务的 OSS 对象前缀。")
+    object_prefix: str = Field(description="按稳定参与者 ID 隔离的任务 OSS 前缀。")
     manifest_key: str = Field(description="manifest.json 的 OSS 对象键。")
     manifest_crc64: str = Field(description="manifest.json 的 OSS CRC64。")
     uploaded_bytes: int = Field(description="校验通过的总字节数。")

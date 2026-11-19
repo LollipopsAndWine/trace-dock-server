@@ -28,7 +28,11 @@ class TokenSecurityTests(unittest.TestCase):
     def test_wrong_pepper_tampering_and_legacy_token_are_rejected(self):
         token = issue_token("person@example.com", "p" * 48)
 
-        for value in (token[:-1] + ("A" if token[-1] != "A" else "B"), "old-random-token"):
+        # Changing the final base64 character can touch only unused padding bits.
+        # Change a middle character to ensure the authenticated bytes differ.
+        middle = len(token) // 2
+        tampered = token[:middle] + ("A" if token[middle] != "A" else "B") + token[middle + 1:]
+        for value in (tampered, "old-random-token"):
             with self.subTest(token=value[:12]), self.assertRaises(ValueError):
                 recover_email(value, "p" * 48)
         with self.assertRaisesRegex(ValueError, "TOKEN_PEPPER"):

@@ -32,7 +32,13 @@ def digest_json(obj):
 
 
 def iso(value):
-    return value.isoformat() if isinstance(value, datetime) else value
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+    return value
 
 
 def record(row):
@@ -244,6 +250,7 @@ class Service:
         check(m["object_prefix"] == prefix and m["object_prefix"].startswith(f"trajectory/participant_id={row['participant_id']}/") and m["object_prefix"].endswith("/"))
         check(m["rules"] == json.loads(row["rules_json"]) and m["selection_mode"] == row["selection_mode"])
         for field in ("consented_at", "upload_confirmed_at"):
+            check(isinstance(m[field], str))
             check(datetime.fromisoformat(m[field].replace("Z", "+00:00")) == datetime.fromisoformat(iso(row[field]).replace("Z", "+00:00")))
         selection = sorted(m["selection"])
         check(len(selection) == len(set(selection)) == row["selected_count"])

@@ -237,6 +237,57 @@ class ServiceTests(unittest.TestCase):
             self.service.complete(self.p, job, completion | {"manifest_crc64": "1"})
         self.assertEqual(error.exception.status, 409)
 
+    def test_receipt_is_identical_for_database_timezone_representations(self):
+        job, _, _, completion = self.prepare_upload()
+        first = self.service.complete(self.p, job, completion)
+        stored = self.read_collection(job)
+        completed = datetime.fromisoformat(first["completed_at"])
+        for offset in (timedelta(hours=8), timedelta(hours=-5, minutes=-30)):
+            local = completed.astimezone(timezone(offset))
+            for value in (local, local.isoformat()):
+                with self.subTest(offset=offset, value_type=type(value).__name__):
+                    receipt = self.service.receipt(stored | {"completed_at": value}, self.prefix)
+                    self.assertEqual(receipt, first)
+                    self.assertTrue(receipt["completed_at"].endswith("+00:00"))
+
+    def test_invalid_manifest_time_types_are_recoverable(self):
+        job, _, original, completion = self.prepare_upload()
+        manifest_key = completion["manifest_key"]
+        valid_manifest = json.loads(original)
+
+        def reopen():
+            self.service.patch(self.p, job, {"state": "collecting"})
+            self.service.patch(self.p, job, {"state": "awaiting_upload_confirmation"})
+            self.service.patch(self.p, job, {
+                "state": "uploading",
+                "upload_confirmed_at": valid_manifest["upload_confirmed_at"],
+            })
+
+        first = True
+        for field in ("consented_at", "upload_confirmed_at"):
+            for value in (123, None, [], {}):
+                with self.subTest(field=field, value=value):
+                    if not first:
+                        reopen()
+                    first = False
+                    manifest = json.loads(original)
+                    manifest[field] = value
+                    body = json.dumps(manifest).encode()
+                    self.store.objects[manifest_key] = body
+                    with self.assertRaises(APIError) as error:
+                        self.service.complete(self.p, job, completion | {"manifest_size_bytes": len(body)})
+                    self.assertEqual(
+                        (error.exception.status, error.exception.code),
+                        (422, "manifest_or_object_verification_failed"),
+                    )
+                    stored = self.read_collection(job)
+                    self.assertEqual(stored["state"], "resumable")
+                    self.assertIsNone(stored["completed_at"])
+
+        reopen()
+        self.store.objects[manifest_key] = original
+        self.assertEqual(self.service.complete(self.p, job, completion)["state"], "completed")
+
     def test_old_token_prefix_manifest_protocol_is_rejected(self):
         job, _, body, completion = self.prepare_upload()
         manifest = json.loads(body)

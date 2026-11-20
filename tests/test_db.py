@@ -158,6 +158,38 @@ class DatabaseTimestampTests(unittest.TestCase):
             self.assertEqual(updated["state"], "cancelled")
             self.assertEqual(list(db.execute("PRAGMA foreign_key_check")), [])
 
+    def test_new_migration_drops_trigger_without_rebuilding_participants(self):
+        with sqlite3.connect(self.path) as conn:
+            conn.executescript("""
+                CREATE TABLE users (email TEXT PRIMARY KEY, created_at TEXT NOT NULL);
+                CREATE TABLE participants (
+                    participant_id TEXT PRIMARY KEY, email TEXT NOT NULL REFERENCES users(email),
+                    token_hash BLOB NOT NULL UNIQUE, status TEXT NOT NULL,
+                    created_at TEXT NOT NULL, revoked_at TEXT);
+                CREATE TRIGGER participants_updated_at_update
+                AFTER UPDATE ON participants
+                BEGIN
+                    UPDATE participants SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE participant_id = NEW.participant_id;
+                END;
+                """)
+            conn.execute("INSERT INTO users VALUES('person@example.com', ?)", (CREATED,))
+            conn.execute("INSERT INTO participants VALUES('participant','person@example.com',?,'active',?,NULL)", (b"hash", CREATED))
+
+        self.db.initialize()
+        with self.sqlite_connection() as db:
+            self.assertIsNone(db.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name='participants_updated_at_update'"
+            ).fetchone())
+        with self.db.session() as session:
+            participant = session.get(Participant, "participant")
+            participant.status = "revoked"
+            session.flush()
+            expected_updated_at = participant.updated_at
+        actual_updated_at = self.read_row("participants")["updated_at"]
+        expected_value = expected_updated_at.isoformat() if isinstance(expected_updated_at, datetime) else expected_updated_at
+        self.assertEqual(parse_time(actual_updated_at), parse_time(expected_value))
+
     def test_parallel_initialization_does_not_duplicate_migrations(self):
         with ThreadPoolExecutor(max_workers=4) as pool:
             list(pool.map(lambda _: Database(self.url, allow_sqlite=True).initialize(), range(4)))

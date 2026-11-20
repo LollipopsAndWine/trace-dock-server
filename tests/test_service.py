@@ -10,6 +10,7 @@ from unittest.mock import patch
 from trace_dock_server.db import Database
 from trace_dock_server.models import Collection, Participant, User
 from trace_dock_server.service import APIError, Service, now, record
+from trace_dock_server.token_security import issue_token
 
 
 class Store:
@@ -44,7 +45,8 @@ class ServiceTests(unittest.TestCase):
         self.store = Store()
         self.service = Service(self.db, self.store, "p" * 32)
         self.addCleanup(self.service.close)
-        token = "random-high-entropy-test-token"
+        token = issue_token("person@example.com", "p" * 32)
+        self.token = token
         hashed = hmac.new(b"p" * 32, token.encode(), hashlib.sha256).digest()
         with self.db.session() as session:
             created_at = now()
@@ -112,15 +114,20 @@ class ServiceTests(unittest.TestCase):
         prefix = first["object_prefix"]
         self.assertTrue(prefix.startswith("trajectory/participant_id=participant/dt="))
         self.assertTrue(prefix.endswith("/job=" + first["job_id"] + "/"))
-        self.assertNotIn("random-high-entropy-test-token", prefix)
+        self.assertNotIn(self.token, prefix)
 
-        other_token = "another-high-entropy-test-token"
+        other_token = issue_token("person@example.com", "p" * 32)
         other_hash = hmac.new(b"p" * 32, other_token.encode(), hashlib.sha256).digest()
         with self.db.session() as session:
             session.get(Participant, "participant").token_hash = other_hash
         rotated = self.service.authenticate("Bearer " + other_token)
         retried = self.service.create(rotated, self.body, "operation")
         self.assertEqual(retried["object_prefix"], prefix)
+
+    def test_old_token_format_is_not_accepted(self):
+        with self.assertRaises(APIError) as error:
+            self.service.authenticate("Bearer td2_old-token-format")
+        self.assertEqual((error.exception.status, error.exception.code), (401, "unauthorized"))
 
     def test_consent_gates_and_frozen_selection(self):
         job = self.create()

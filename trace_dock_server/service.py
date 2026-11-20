@@ -11,6 +11,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from .models import COUNTERS, Collection, Participant
+from .token_security import TOKEN_PREFIX
 
 
 class APIError(Exception):
@@ -48,7 +49,7 @@ def record(row):
 SHA = re.compile(r"^[0-9a-f]{64}$")
 CRC64 = re.compile(r"^(0|[1-9][0-9]{0,19})$")
 ID = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
-TOKEN_PATH = re.compile(r"^[A-Za-z0-9_-]{16,4096}$")
+TOKEN_PATH = re.compile(r"^" + re.escape(TOKEN_PREFIX) + r"[A-Za-z0-9_-]{16,4096}$")
 STATES = {
     "created": {"created", "collecting", "cancelled", "failed"},
     "collecting": {"collecting", "awaiting_upload_confirmation", "resumable", "cancelled", "failed"},

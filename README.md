@@ -108,13 +108,13 @@ curl -fsS http://127.0.0.1:8080/healthz
 .venv/bin/trace-dock-participants revoke person@example.com
 ```
 
-新签发的 token 加密携带邮箱。数据库不可用时，可用保存的 `TOKEN_PEPPER` 从 token 恢复邮箱，不需要连接数据库：
+新签发的 `td3_` token 使用紧凑二进制格式加密携带邮箱，通常约 55～75 个字符。数据库不可用时，可用保存的 `TOKEN_PEPPER` 从 token 恢复邮箱，不需要连接数据库：
 
 ```bash
 .venv/bin/trace-dock-token-email
 ```
 
-命令会隐藏式提示输入 token，只输出邮箱。旧格式 token 不包含邮箱，不能恢复。
+命令会隐藏式提示输入 token，只输出邮箱。当前只接受 `td3_` 紧凑 token 格式；旧格式 token 不再兼容。新格式使用 8 字节 nonce 和 12 字节认证标签，邮箱长度不同会导致 token 长度不同。
 
 ### 5. 连接 CLI
 

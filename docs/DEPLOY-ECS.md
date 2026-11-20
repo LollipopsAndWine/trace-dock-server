@@ -72,7 +72,7 @@ docker compose run --rm --no-deps api trace-dock-verify-oss
 
 token 通过受控渠道交付本人，不写进 Dockerfile 或镜像。不要把 `docker compose config` 的完整输出保存或转发，其中可能包含运行时凭据；校验配置使用前述 `--quiet`。
 
-新 token 加密携带邮箱。数据库不可用时，仍可用 `TOKEN_PEPPER` 通过 `.venv/bin/trace-dock-token-email` 恢复邮箱；该命令只需 pepper，不连接数据库。请将 `TOKEN_PEPPER` 纳入安全备份。
+新 `td3_` token 使用紧凑二进制格式加密携带邮箱，通常约 55～75 个字符。数据库不可用时，仍可用 `TOKEN_PEPPER` 通过 `.venv/bin/trace-dock-token-email` 恢复邮箱；该命令只需 pepper，不连接数据库。请将 `TOKEN_PEPPER` 纳入安全备份。旧 token 格式不再兼容。
 
 ## 5. HTTPS 域名与 Nginx
 

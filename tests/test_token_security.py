@@ -14,6 +14,8 @@ class TokenSecurityTests(unittest.TestCase):
         token = issue_token(email, "p" * 48)
 
         self.assertRegex(token, re.compile(r"^[A-Za-z0-9_-]{16,4096}$"))
+        self.assertTrue(token.startswith("td3_"))
+        self.assertLessEqual(len(token), 66)
         self.assertNotIn(email, token)
         self.assertEqual(recover_email(token, "p" * 48), email)
 
@@ -24,6 +26,13 @@ class TokenSecurityTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertEqual(recover_email(first, "p" * 48), "person@example.com")
         self.assertEqual(recover_email(second, "p" * 48), "person@example.com")
+
+    def test_compact_token_length_tracks_email_length(self):
+        short = issue_token("person@example.com", "p" * 48)
+        long = issue_token("very.long.user.name@example.com", "p" * 48)
+        self.assertLess(len(short), len(long))
+        self.assertLessEqual(len(short), 60)
+        self.assertLessEqual(len(long), 80)
 
     def test_wrong_pepper_tampering_and_legacy_token_are_rejected(self):
         token = issue_token("person@example.com", "p" * 48)
@@ -37,6 +46,8 @@ class TokenSecurityTests(unittest.TestCase):
                 recover_email(value, "p" * 48)
         with self.assertRaisesRegex(ValueError, "TOKEN_PEPPER"):
             recover_email(token, "q" * 48)
+        with self.assertRaises(ValueError):
+            recover_email("td2_legacy-token", "p" * 48)
 
     def test_recovery_command_uses_pepper_without_database_settings(self):
         token = issue_token("person@example.com", "p" * 48)
